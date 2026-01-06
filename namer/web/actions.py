@@ -18,6 +18,8 @@ from werkzeug.routing import Rule
 from namer.comparison_results import ComparisonResults, SceneType
 from namer.configuration import NamerConfig
 from namer.command import gather_target_files_from_dir, is_interesting_movie, is_relative_to, Command
+from namer.database import search_file_in_database
+from namer.ffmpeg import FFMpeg
 from namer.fileinfo import FileInfo, parse_file_name
 from namer.metadataapi import __build_url, __evaluate_match, __request_response_json_object, __metadataapi_response_to_data
 from namer.namer import calculate_phash
@@ -98,6 +100,36 @@ def command_to_file_info(command: Command, config: NamerConfig) -> Dict:
     return res
 
 
+def __get_file_duration(file_name: str, config: NamerConfig) -> Optional[int]:
+    """
+    Get file duration from database cache or FFProbe.
+    Returns duration in seconds, or None if unavailable.
+    """
+    # Construct file path in failed_dir
+    file_path = Path(config.failed_dir) / file_name
+
+    # Check if file exists
+    if not file_path.exists():
+        return None
+
+    # Try to get from database cache first
+    cached_file = search_file_in_database(file_path)
+    if cached_file and cached_file.duration:
+        return cached_file.duration
+
+    # Fallback to FFProbe if not cached
+    try:
+        ffmpeg = FFMpeg(config.ffmpeg_path, config.ffprobe_path)
+        probe_result = ffmpeg.ffprobe(file_path)
+        if probe_result and probe_result.format and probe_result.format.duration:
+            return int(probe_result.format.duration)
+    except Exception:
+        # Silently fail if FFProbe unavailable
+        pass
+
+    return None
+
+
 def metadataapi_responses_to_webui_response(responses: Dict, config: NamerConfig, file: str, phash: Optional[PerceptualHash] = None) -> List:
     file = Path(file)
     file_name = file.stem
@@ -112,6 +144,9 @@ def metadataapi_responses_to_webui_response(responses: Dict, config: NamerConfig
             name_parts = parse_file_name(file_name, config)
             file_infos.extend(__metadataapi_response_to_data(json_obj, url, formatted, name_parts, config))
 
+    # Get file duration once (cache lookup or FFProbe)
+    file_duration = __get_file_duration(file_name, config)
+
     files = []
     for scene_data in file_infos:
         scene = __evaluate_match(scene_data.original_parsed_filename, scene_data, config, phash).as_dict()
@@ -123,11 +158,13 @@ def metadataapi_responses_to_webui_response(responses: Dict, config: NamerConfig
                     'type': scene_data.type.value,
                     'name': scene_data.name,
                     'date': scene_data.date,
+                    'duration': scene_data.duration,  # TPDB duration
                     'poster_url': scene_data.poster_url,
                     'site': scene_data.site,
                     'network': scene_data.network,
                     'performers': scene_data.performers,
                 },
+                'file_duration': file_duration,  # File duration from cache/FFProbe
             }
         )
         files.append(scene)
